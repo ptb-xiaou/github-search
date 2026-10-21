@@ -1,0 +1,30 @@
+# .gitignore — github-search skill bundle
+#
+# This file is what keeps the skill publishable: everything the skill needs to
+# *work on your machine* lives in the paths below and is never committed.
+# The skill reads its token from OUTSIDE this directory by preference:
+#
+#     1. $GITHUB_TOKEN / $GH_TOKEN                      (environment)
+#     2. $DSH_HOME/secrets/github-search.json           (~/.dsh/secrets/... — recommended)
+#     3. <this bundle>/.secrets/github-search.json      (portable fallback, ignored below)
+#
+# Copy config.example.json to one of those locations and put your token in it.
+
+# --- credentials: never publish ---
+.secrets/
+config.local.json
+config.json
+*.token
+*.tokens
+*.secret
+*.secrets
+credentials.json
+.env
+.env.*
+!.env.example
+
+# --- local noise ---
+node_modules/
+*.log
+.DS_Store
+Thumbs.db

@@ -1,0 +1,6 @@
+{
+  "_comment": "TEMPLATE ONLY — never commit a real token. Copy this file to $DSH_HOME/secrets/github-search.json (i.e. ~/.dsh/secrets/github-search.json) or to <skill>/.secrets/github-search.json, then replace the placeholder.",
+  "token": "REPLACE_WITH_YOUR_GITHUB_TOKEN",
+  "apiBase": "https://api.github.com",
+  "userAgent": "dsh-github-search-skill/1.0"
+}
