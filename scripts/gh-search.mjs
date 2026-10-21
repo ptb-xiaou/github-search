@@ -20,6 +20,8 @@ import { homedir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import net from 'node:net';
+import tls from 'node:tls';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const BUNDLE = resolve(HERE, '..');
@@ -31,7 +33,7 @@ const API_VERSION = '2022-11-28';
 
 /** Flags that never consume the next token. */
 const BOOLEAN_FLAGS = new Set([
-  'json', 'help', 'dry-run', 'yes', 'no-wait',
+  'json', 'help', 'dry-run', 'yes', 'no-wait', 'no-proxy',
   'public', 'private', 'auto-init', 'no-issues', 'wiki', 'archive', 'unarchive',
 ]);
 
@@ -190,6 +192,276 @@ function requireToken(flags) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// ------------------------------------------------------------- proxy
+//
+// On networks where github.com:443 is reset or times out (while api.github.com
+// still answers), a local proxy — Clash, mihomo, sing-box, v2rayN — is usually
+// already running. Resolution order:
+//
+//   --proxy <url>  >  --proxy auto  >  $GITHUB_SEARCH_PROXY
+//                  >  $DSH_GITHUB_SEARCH_PROXY  >  $HTTPS_PROXY / $ALL_PROXY
+//
+// With no proxy configured, a request that fails at the network layer makes the
+// client probe the usual local proxy ports and retry — no flag needed. That
+// fallback is skipped for `--no-proxy` and for an explicit `--proxy <url>`.
+// Requests go through an HTTP CONNECT tunnel implemented with node:net +
+// node:tls, so there is still no dependency to install.
+
+const PROXY_ENV_VARS = [
+  'GITHUB_SEARCH_PROXY',
+  'DSH_GITHUB_SEARCH_PROXY',
+  'HTTPS_PROXY',
+  'https_proxy',
+  'ALL_PROXY',
+  'all_proxy',
+];
+
+// Clash 7890, Clash Verge 7897, v2rayN 10809, generic 1080/8888/8080.
+const LOCAL_PROXY_PORTS = [7890, 7897, 10809, 1080, 8888, 8080];
+
+const PROXY = { disabled: false, explicit: false, url: null, source: null };
+
+function normalizeProxyUrl(raw) {
+  if (!raw) return null;
+  let s = String(raw).trim();
+  if (!s) return null;
+  if (/^(none|off|no|false|direct)$/i.test(s)) return null;
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) s = `http://${s}`;
+  try {
+    const u = new URL(s);
+    if (!u.hostname) return null;
+    return u.toString().replace(/\/$/, '');
+  } catch {
+    return null;
+  }
+}
+
+function resolveProxy(flags = {}) {
+  if (flags['no-proxy'] === true) {
+    PROXY.disabled = true;
+    return;
+  }
+  if (typeof flags.proxy === 'string') {
+    PROXY.explicit = true;
+    if (flags.proxy === 'auto') {
+      PROXY.source = '--proxy auto (probing local ports)';
+      return;
+    }
+    const url = normalizeProxyUrl(flags.proxy);
+    if (!url) throw new Error(`invalid --proxy value: ${flags.proxy}`);
+    PROXY.url = url;
+    PROXY.source = '--proxy';
+    return;
+  }
+  for (const name of PROXY_ENV_VARS) {
+    const url = normalizeProxyUrl(process.env[name]);
+    if (url) {
+      PROXY.url = url;
+      PROXY.source = `$${name}`;
+      return;
+    }
+  }
+}
+
+function probePort(port, host = '127.0.0.1', timeoutMs = 400) {
+  return new Promise((done) => {
+    const socket = net.connect({ host, port });
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      done(ok);
+    };
+    socket.setTimeout(timeoutMs, () => finish(false));
+    socket.once('connect', () => finish(true));
+    socket.once('error', () => finish(false));
+  });
+}
+
+async function detectLocalProxy() {
+  if (PROXY.url) return PROXY.url;
+  if (!PROXY.detection) {
+    PROXY.detection = (async () => {
+      for (const port of LOCAL_PROXY_PORTS) {
+        // sequential on purpose: the first listed port is the most common default
+        // eslint-disable-next-line no-await-in-loop
+        if (await probePort(port)) {
+          PROXY.url = `http://127.0.0.1:${port}`;
+          PROXY.source = `auto-detected local proxy on port ${port}`;
+          announceProxy();
+          return PROXY.url;
+        }
+      }
+      return null;
+    })().finally(() => {
+      PROXY.detection = null;
+    });
+  }
+  return PROXY.detection;
+}
+
+function announceProxy() {
+  if (PROXY.announced || !PROXY.url) return;
+  PROXY.announced = true;
+  process.stderr.write(`[proxy] using ${PROXY.url} [${PROXY.source}]\n`);
+}
+
+function openTunnel(proxyUrl, targetHost, targetPort, timeoutMs = 15000) {
+  const proxy = new URL(proxyUrl);
+  const proxyHost = proxy.hostname;
+  const proxyPort = Number(proxy.port || (proxy.protocol === 'https:' ? 443 : 80));
+  return new Promise((resolveTunnel, reject) => {
+    const socket = net.connect({ host: proxyHost, port: proxyPort });
+    let settled = false;
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      reject(err);
+    };
+    socket.setTimeout(timeoutMs, () => fail(new Error(`proxy ${proxyHost}:${proxyPort} did not answer CONNECT in ${timeoutMs}ms`)));
+    socket.once('error', fail);
+    socket.once('connect', () => {
+      const auth =
+        proxy.username !== ''
+          ? `Proxy-Authorization: Basic ${Buffer.from(
+              `${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`,
+            ).toString('base64')}\r\n`
+          : '';
+      socket.write(
+        `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n${auth}Proxy-Connection: keep-alive\r\n\r\n`,
+      );
+      let head = '';
+      const onData = (chunk) => {
+        head += chunk.toString('latin1');
+        const sep = head.indexOf('\r\n\r\n');
+        if (sep === -1) return;
+        socket.removeListener('data', onData);
+        const statusLine = head.slice(0, head.indexOf('\r\n'));
+        const status = Number(statusLine.split(' ')[1]);
+        if (status !== 200) {
+          fail(new Error(`proxy CONNECT rejected: ${statusLine}`));
+          return;
+        }
+        const leftover = Buffer.from(head.slice(sep + 4), 'latin1');
+        if (leftover.length) socket.unshift(leftover);
+        socket.setTimeout(0);
+        settled = true;
+        resolveTunnel(socket);
+      };
+      socket.on('data', onData);
+    });
+  });
+}
+
+function dechunk(buf) {
+  const parts = [];
+  let i = 0;
+  for (;;) {
+    const lineEnd = buf.indexOf('\r\n', i);
+    if (lineEnd === -1) throw new Error('truncated chunked body');
+    const size = parseInt(buf.toString('latin1', i, lineEnd), 16);
+    if (Number.isNaN(size)) throw new Error('malformed chunk header');
+    i = lineEnd + 2;
+    if (size === 0) return Buffer.concat(parts);
+    if (buf.length < i + size + 2) throw new Error('truncated chunked body');
+    parts.push(buf.subarray(i, i + size));
+    i += size + 2;
+  }
+}
+
+function parseHttpResponse(buf, url) {
+  const sep = buf.indexOf('\r\n\r\n');
+  if (sep === -1) throw new Error(`malformed HTTP response from ${url}`);
+  const head = buf.subarray(0, sep).toString('latin1').split('\r\n');
+  const status = Number(head[0].split(' ')[1]);
+  const headers = {};
+  for (const line of head.slice(1)) {
+    const colon = line.indexOf(':');
+    if (colon === -1) continue;
+    headers[line.slice(0, colon).trim().toLowerCase()] = line.slice(colon + 1).trim();
+  }
+  let body = buf.subarray(sep + 4);
+  if ((headers['transfer-encoding'] || '').toLowerCase().includes('chunked')) body = dechunk(body);
+  return { status, headers, body };
+}
+
+/** fetch()-shaped request over an HTTP CONNECT tunnel (no extra packages). */
+async function proxyRequest(url, init = {}, proxyUrl) {
+  const target = new URL(url);
+  const method = init.method || 'GET';
+  const payload =
+    init.body === undefined || init.body === null
+      ? null
+      : Buffer.from(typeof init.body === 'string' ? init.body : JSON.stringify(init.body));
+  const tunnel = await openTunnel(proxyUrl, target.hostname, Number(target.port || 443));
+  const response = await new Promise((resolveResponse, reject) => {
+    const socket = tls.connect({ socket: tunnel, servername: target.hostname });
+    const chunks = [];
+    const done = (err, value) => {
+      socket.destroy();
+      tunnel.destroy();
+      if (err) reject(err);
+      else resolveResponse(value);
+    };
+    socket.setTimeout(60000, () => done(new Error(`request through proxy timed out: ${url}`)));
+    socket.once('error', (err) => done(err));
+    socket.once('secureConnect', () => {
+      const headers = { ...(init.headers || {}), Connection: 'close' };
+      if (headers['Accept-Encoding'] === undefined) headers['Accept-Encoding'] = 'identity';
+      if (payload) headers['Content-Length'] = String(payload.length);
+      let raw = `${method} ${target.pathname}${target.search} HTTP/1.1\r\nHost: ${target.host}\r\n`;
+      for (const [k, v] of Object.entries(headers)) raw += `${k}: ${v}\r\n`;
+      socket.write(`${raw}\r\n`);
+      if (payload) socket.write(payload);
+    });
+    socket.on('data', (chunk) => chunks.push(chunk));
+    socket.once('end', () => {
+      try {
+        done(null, parseHttpResponse(Buffer.concat(chunks), url));
+      } catch (err) {
+        done(err);
+      }
+    });
+  });
+  return {
+    status: response.status,
+    ok: response.status >= 200 && response.status < 300,
+    headers: { get: (name) => response.headers[String(name).toLowerCase()] ?? null },
+    text: async () => response.body.toString('utf8'),
+  };
+}
+
+/** Network-layer failure, i.e. worth retrying through a proxy. */
+function isNetworkError(err) {
+  const code = err?.cause?.code || err?.code || '';
+  if (['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'EPIPE'].includes(code)) return true;
+  return /fetch failed|socket hang up|network|timed out|connection (reset|refused|closed)/i.test(
+    `${err?.message || ''} ${err?.cause?.message || ''}`,
+  );
+}
+
+async function httpFetch(url, init = {}) {
+  if (!PROXY.disabled && PROXY.explicit && !PROXY.url) await detectLocalProxy();
+  if (PROXY.url) return proxyRequest(url, init, PROXY.url);
+
+  try {
+    return await fetch(url, init);
+  } catch (err) {
+    if (PROXY.disabled || !isNetworkError(err)) throw err;
+    const found = await detectLocalProxy();
+    if (!found) throw err;
+    if (!PROXY.fallbackAnnounced) {
+      PROXY.fallbackAnnounced = true;
+      process.stderr.write(
+        `[proxy] direct connection failed (${err?.cause?.code || err.message}); retrying via ${found} [${PROXY.source}]\n`,
+      );
+    }
+    return proxyRequest(url, init, found);
+  }
+}
+
 class ApiError extends Error {
   constructor(status, message, meta = {}) {
     super(message);
@@ -212,7 +484,7 @@ async function callApi(url, { token, maxWaitMs = 70000, noWait = false, method =
       payload = typeof body === 'string' ? body : JSON.stringify(body);
     }
 
-    const res = await fetch(url, {
+    const res = await httpFetch(url, {
       method,
       headers,
       body: payload,
@@ -384,6 +656,18 @@ function gitAt(dir, args, extraEnv = {}) {
   });
 }
 
+/** git config overrides that route the push through the resolved proxy. */
+function proxyGitArgs() {
+  return PROXY.url ? ['-c', `http.proxy=${PROXY.url}`] : [];
+}
+
+function firstLine(text) {
+  return String(text || '')
+    .split('\n')
+    .map((s) => s.trim())
+    .find(Boolean) || '';
+}
+
 /** Auth for git over HTTPS without ever writing the token to .git/config. */
 function authEnv(token) {
   const basic = Buffer.from(`x-access-token:${token}`, 'utf8').toString('base64');
@@ -472,8 +756,20 @@ async function runPublish({ dir, flags, token, dryRun }) {
   }
 
   console.log(`[publish] pushing ${branch} -> ${remote} (${remoteUrl.replace(/\/\/[^@/]+@/, '//')})`);
-  const push = gitAt(dir, ['push', '-u', remote, branch], authEnv(token));
-  if (push.status !== 0) throw new Error(redact(errText(push), token) || 'git push failed');
+  let push = gitAt(dir, [...proxyGitArgs(), 'push', '-u', remote, branch], authEnv(token));
+  if (push.status !== 0) {
+    const failure = redact(errText(push), token);
+    // Same story as the API: git talks to github.com:443 directly, and that is
+    // exactly the host that gets reset on filtered networks.
+    if (!PROXY.disabled && !PROXY.url) {
+      const found = await detectLocalProxy();
+      if (found) {
+        console.log(`[proxy] git push failed (${firstLine(failure)}); retrying via ${found} [${PROXY.source}]`);
+        push = gitAt(dir, [`-c`, `http.proxy=${found}`, 'push', '-u', remote, branch], authEnv(token));
+      }
+    }
+    if (push.status !== 0) throw new Error(redact(errText(push), token) || 'git push failed');
+  }
   console.log('[publish] push OK');
 }
 
@@ -551,6 +847,13 @@ Credential flags:
   --no-wait          fail instead of waiting out a rate limit
   --max-wait <sec>   cap on automatic waiting (default 70)
 
+Network flags:
+  --proxy <url>      send requests through an HTTP proxy, e.g. http://127.0.0.1:7890
+  --proxy auto       probe the usual local proxy ports (7890 7897 10809 1080 8888 8080)
+  --no-proxy         never use or auto-detect a proxy
+                     (without any proxy flag, a network failure triggers one auto-detect retry)
+  Env: $GITHUB_SEARCH_PROXY, $DSH_GITHUB_SEARCH_PROXY, $HTTPS_PROXY, $ALL_PROXY
+
 Query qualifiers: see references/search-syntax.md
 Examples:
   node scripts/gh-search.mjs repo "agent framework language:python stars:>1000" --limit 5
@@ -576,6 +879,8 @@ async function main() {
     return;
   }
 
+  resolveProxy(flags);
+
   if (cmd === 'config' || cmd === 'where') {
     const active = resolveCredentials(flags);
     console.log(`active source : ${active.source || '(none)'}`);
@@ -586,6 +891,13 @@ async function main() {
     }
     for (const name of ['GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_SEARCH_CONFIG', 'DSH_GITHUB_SEARCH_CONFIG']) {
       console.log(`  env ${name}: ${process.env[name] ? 'set' : 'unset'}`);
+    }
+    if (PROXY.disabled) console.log('proxy         : disabled (--no-proxy)');
+    else if (PROXY.url) console.log(`proxy         : ${PROXY.url}  [${PROXY.source}]`);
+    else if (PROXY.explicit) console.log(`proxy         : not resolved yet  [${PROXY.source}]`);
+    else console.log('proxy         : direct (auto-detect on network failure)');
+    for (const name of PROXY_ENV_VARS) {
+      if (process.env[name]) console.log(`  env ${name}: set`);
     }
     return;
   }
@@ -600,6 +912,7 @@ async function main() {
     ]);
     console.log(`token source : ${cred.source}`);
     console.log(`token        : ${mask(cred.token)}`);
+    if (PROXY.url) console.log(`proxy        : ${PROXY.url}  [${PROXY.source}]`);
     if (cred.warning) console.log(`warning      : ${cred.warning}`);
     console.log(`login        : ${me.data.login} (${me.data.type})`);
     console.log(`scopes       : ${me.rate.scopes || '(none)'}`);
