@@ -1,9 +1,9 @@
 ---
 name: github-search
-description: Search GitHub repositories, code, issues, pull requests, commits and users through the GitHub REST API using a locally configured token. Use for finding projects, locating code or symbols anywhere on GitHub, looking up issues/PRs, checking a token's scopes or rate limits, or any 中文请求 like "在 GitHub 上搜…/找项目/搜代码/查 issue".
-whenToUse: The user wants to find something on GitHub (repos, code across repos, issues, PRs, commits, users), or needs GitHub API queries, rate-limit/scope diagnostics, or help wiring up a GitHub token for searching.
+description: Search GitHub repositories, code, issues, pull requests, commits and users through the GitHub REST API using a locally configured token, and manage repositories (create, edit, publish) from the same client. Use for finding projects, locating code or symbols anywhere on GitHub, looking up issues/PRs, creating a public repository and pushing a local project, checking a token's scopes or rate limits, or any 中文请求 like "在 GitHub 上搜…/找项目/搜代码/查 issue/建仓库/发布仓库".
+whenToUse: The user wants to find something on GitHub (repos, code across repos, issues, PRs, commits, users), needs GitHub API queries or rate-limit/scope diagnostics, wants to create/rename/archive/delete a repository, or wants to publish a local git repository to GitHub.
 metadata:
-  version: "1.0.0"
+  version: "1.1.0"
   runtime: node>=18
   credential_file: "$DSH_HOME/secrets/github-search.json"
   repository: https://github.com/ptb-xiaou/github-search
@@ -35,7 +35,18 @@ thin wrapper that forwards to Node.
 | `issues <q>` | Search issues **and** pull requests |
 | `commits <q>` | Search commit messages |
 | `users <q>` | Search users and organizations |
-| `api <path>` | Call any REST path (`api repos/nodejs/node --param per_page=5`) |
+| `api <path>` | Call any REST path (`api repos/nodejs/node --param per_page=5`; write with `--method POST --data '<json>'`) |
+
+Repository commands (these write to GitHub — see the rules below):
+
+| Command | Purpose |
+|---|---|
+| `repo-create <name>` | Create a repository; **private unless `--public`** |
+| `repo-view <owner/repo>` | Visibility, branch, license, topics, size, timestamps |
+| `repo-list` | List repositories you own |
+| `repo-edit <owner/repo>` | Description, homepage, name, default branch, visibility, archive, topics |
+| `repo-delete <owner/repo> --yes` | Delete a repository (irreversible) |
+| `publish [dir]` | Publish gate → commit → push |
 
 Common flags: `--limit <n>` (default 10, max 100), `--sort`, `--order`,
 `--json` (raw payload), `--param k=v`, `--token-file <p>`, `--no-wait`.
@@ -60,6 +71,45 @@ Common flags: `--limit <n>` (default 10, max 100), `--sort`, `--order`,
    return; if the search returns nothing, say so and show the query used.
 6. **Use `--json`** when you need fields the table view omits (topics, license,
    `pushed_at`, patch URLs) or when you are going to post-process the payload.
+7. **Confirm before any write.** Repository commands change real GitHub state.
+   Say exactly what will change (visibility, name, deleted repo) and get a yes
+   before running them, even when the user's intent seems obvious.
+
+## Repository management
+
+These commands write to GitHub. They are not previews:
+
+| Command | Effect |
+|---|---|
+| `repo-create <name>` | Create a repository, **private unless `--public`** |
+| `repo-view <owner/repo>` | Show visibility, branch, license, topics, size, timestamps |
+| `repo-list` | List repositories you own (`--visibility public`, `--affiliation owner`) |
+| `repo-edit <owner/repo>` | Description, homepage, name, default branch, visibility, archive, topics |
+| `repo-delete <owner/repo> --yes` | Delete a repository — irreversible |
+| `publish [dir]` | Publish gate → commit → push |
+
+Rules:
+
+- **`--public` is never implied.** `repo-create` defaults to private and prints a
+  `[note]` saying so. An accidental public repository exposes code the moment it
+  is created, so pass `--public` only when the user asked for a public repo.
+- **`repo-delete` needs `--yes`, and needs the `delete_repo` scope.** A classic
+  PAT with `repo` alone does **not** get it: the API answers
+  `403 Must have admin rights to Repository.` When that happens, tell the user
+  which scope is missing and offer the web UI link — do not retry with other
+  credentials or claim the repository is gone.
+- **`--topics` replaces the whole list** on `repo-edit`. Read the current topics
+  with `repo-view` first, then send the full desired list.
+- **`--dry-run` on any write command** prints the HTTP method, URL and body
+  without sending it. For `publish` it prints the paths that would be committed.
+  Use it whenever the user is unsure what a command would do.
+- **`publish` never stores the token.** It hands git an `AUTHORIZATION` header
+  through an environment-scoped config, so the token stays out of `.git/config`,
+  the remote URL and the commit. It refuses to commit or push when
+  `check-public-safe.mjs --history` fails.
+- A bare token with `repo` scope can create and edit repositories but not delete
+  them; creating inside an organisation additionally requires that org to allow
+  it for your account. Surface the API error verbatim instead of guessing.
 
 ## Credentials
 
@@ -115,6 +165,16 @@ node scripts/check-public-safe.mjs --history   # exits non-zero on any leak
 That gate scans the working tree for token-shaped strings, verifies `.gitignore`
 covers `.secrets/` and `config.local.json`, and checks the last 200 commits.
 `.gitignore` in this bundle already excludes every credential path.
+
+Or run the whole goodbye in the safe order:
+
+```bash
+node scripts/gh-search.mjs publish -m "feat: …"          # gate → commit → push
+node scripts/gh-search.mjs publish --dry-run -m "feat: …"  # preview only
+```
+
+`publish` aborts unless the gate says SAFE, then commits and pushes with an
+ephemeral token header (nothing is written into the repository).
 
 ## Resources
 
