@@ -3,7 +3,7 @@ name: github-search
 description: Search GitHub repositories, code, issues, pull requests, commits and users through the GitHub REST API using a locally configured token, and manage repositories (create, edit, publish) from the same client. Use for finding projects, locating code or symbols anywhere on GitHub, looking up issues/PRs, creating a public repository and pushing a local project, checking a token's scopes or rate limits, or any 中文请求 like "在 GitHub 上搜…/找项目/搜代码/查 issue/建仓库/发布仓库".
 whenToUse: The user wants to find something on GitHub (repos, code across repos, issues, PRs, commits, users), needs GitHub API queries or rate-limit/scope diagnostics, wants to create/rename/archive/delete a repository, or wants to publish a local git repository to GitHub.
 metadata:
-  version: "1.1.0"
+  version: "1.2.0"
   runtime: node>=18
   credential_file: "$DSH_HOME/secrets/github-search.json"
   repository: https://github.com/ptb-xiaou/github-search
@@ -153,6 +153,37 @@ Rules when handling credentials:
 - Failure to find a token exits with code 3 and prints the credential file paths
   — relay those paths to the user rather than asking them to paste a token into
   the conversation.
+- **Network failures are not API failures.** `fetch failed`, `ECONNRESET`,
+  `unable to access 'https://github.com/…'` usually mean the network filters
+  github.com, not that the token is wrong. See the proxy section below before
+  telling the user anything is misconfigured.
+
+## Networks and proxies
+
+On filtered networks `github.com:443` is often reset (so `git push` dies) while
+`api.github.com` still answers, and sometimes both are unreachable. A local
+proxy — Clash/mihomo on 7890, Clash Verge on 7897, v2rayN on 10809, sing-box on
+1080/8080 — fixes both paths:
+
+```bash
+node scripts/gh-search.mjs check --proxy http://127.0.0.1:7890
+node scripts/gh-search.mjs check --proxy auto            # probe the usual local ports
+node scripts/gh-search.mjs repo "stars:>5000" --proxy auto
+node scripts/gh-search.mjs publish -m "feat: …"         # push retries through the proxy
+```
+
+- With **no proxy flag**, a request that fails at the network layer triggers one
+  auto-detect retry through the first local port that answers
+  (`7890`, `7897`, `10809`, `1080`, `8888`, `8080`). `publish` does the same for
+  `git push`, so a filtered network does not block publishing.
+- `$GITHUB_SEARCH_PROXY`, `$DSH_GITHUB_SEARCH_PROXY`, `$HTTPS_PROXY` and
+  `$ALL_PROXY` are honored when no flag is given; the flag always wins.
+- `--no-proxy` disables auto-detection and the fallback entirely.
+- Authenticated proxies work: `--proxy http://user:pass@host:port` sends a Basic
+  `Proxy-Authorization` header. Prefer the environment variable over the flag so
+  the proxy password does not land in shell history.
+- The proxy only carries traffic; credentials are still read from the credential
+  file and never written to disk by the client.
 
 ## Publishing this skill
 

@@ -9,6 +9,8 @@ credential kept **outside** this bundle.
 - One command per search, table or `--json` output
 - Rate-limit aware: prints the live budget, waits out a short reset
 - Create, view, edit, list, delete and publish repositories — dry-run first
+- Proxy-aware: `--proxy`, env vars, and automatic local-Clash detection when a
+  network filters github.com
 - Ships a publish gate that refuses to let a token leave with the skill
 
 Published at <https://github.com/ptb-xiaou/github-search>.
@@ -123,6 +125,38 @@ node scripts/gh-search.mjs repo-create demo --public --dry-run
 `--public` is never implied, `--yes` is mandatory for deletion, and `repo-edit`
 refuses to run with no changes. For anything unusual, `api` can call any REST
 path: `api user/repos --method POST --data '{"name":"x"}'`.
+
+## Behind a proxy
+
+Some networks reset `github.com:443` — `git push` dies with
+`unable to access … Recv failure: Connection was reset` — while `api.github.com`
+still answers, and some block both. A locally running proxy fixes both paths:
+
+```bash
+node scripts/gh-search.mjs check --proxy http://127.0.0.1:7890
+node scripts/gh-search.mjs check --proxy auto      # probe 7890, 7897, 10809, 1080, 8888, 8080
+node scripts/gh-search.mjs publish -m "feat: …"    # gate → commit → push (retries via the proxy)
+```
+
+Precedence, first match wins:
+
+| # | Source |
+|---|---|
+| 1 | `--proxy <url>` |
+| 2 | `--proxy auto` |
+| 3 | `$GITHUB_SEARCH_PROXY` |
+| 4 | `$DSH_GITHUB_SEARCH_PROXY` |
+| 5 | `$HTTPS_PROXY` / `$ALL_PROXY` |
+
+With no proxy configured, a network-level failure triggers **one** automatic
+retry through the first local port that answers. `publish` applies the same
+fallback to `git push`, so a filtered network does not block publishing.
+`--no-proxy` turns all of it off. Authenticated proxies
+(`http://user:pass@host:port`) send a Basic `Proxy-Authorization` header — put
+those in an environment variable rather than a shell history entry.
+
+Requests go through an HTTP `CONNECT` tunnel built on `node:net` + `node:tls`,
+so proxying adds no dependency and no TLS downgrade.
 
 ## Publishing this skill publicly
 
