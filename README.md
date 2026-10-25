@@ -96,6 +96,45 @@ node scripts/gh-search.mjs api repos/nodejs/node --param per_page=5 --json
 `--help` prints the full flag list; `references/search-syntax.md` documents the
 qualifiers.
 
+## Search quality (`repo`)
+
+`repo` search is quality-ranked by default: archived and stale repositories are
+removed first, then the survivors are scored by `log10(stars)` + `1.2 × recency`
++ forks, with an ~8-month recency half-life. Stars lead the score, but a year of
+silence costs about one order of magnitude of stars, so a live 40k-star project
+outranks a dormant 120k-star one. The top rows are therefore popular **and**
+alive — GitHub's own best-match order puts archived 8k-star projects and dormant
+lists first, and this does not.
+
+```bash
+node scripts/gh-search.mjs repo "mcp server" --limit 5
+# total_count: 176597  (ranked 43/50 by quality, showing 5)
+# [quality] dropped 3 archived, 4 stale (of 50 candidates)
+
+# tighten the bar
+node scripts/gh-search.mjs repo "mcp server" --limit 5 --min-stars 5000 --active-within 90
+
+# opt out / override
+node scripts/gh-search.mjs repo "mcp server" --limit 5 --no-quality      # GitHub's own order
+node scripts/gh-search.mjs repo "mcp server" --limit 5 --sort stars      # explicit sort wins
+node scripts/gh-search.mjs repo "mcp server" --limit 5 --quality --sort stars   # force re-rank
+```
+
+| Flag | Effect |
+|---|---|
+| `--no-quality` | Use GitHub's own best-match order |
+| `--quality` | Re-rank even when `--sort` is given |
+| `--active-within <days>` | Drop repos not pushed in N days (default 730; `0` keeps all) |
+| `--min-stars <n>` | Drop repos below n stars (default 0) |
+| `--include-archived` | Keep archived/disabled repos (dropped by default) |
+| `--no-forks` | Also drop forks (kept by default) |
+| `--candidates <n>` | Candidates fetched for ranking (default `min(100, max(limit*5, 50))`) |
+
+When everything is filtered out the tool says so on stderr and suggests
+`--active-within 0`, `--include-archived`, or `--min-stars 0`. `--json` returns
+the raw GitHub payload, so it bypasses the local ranking by design (with a
+`[quality]` note on stderr).
+
 ## Manage repositories
 
 ```bash

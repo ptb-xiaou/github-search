@@ -26,8 +26,9 @@ import tls from 'node:tls';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const BUNDLE = resolve(HERE, '..');
 const DEFAULT_API = 'https://api.github.com';
-const DEFAULT_UA = 'dsh-github-search-skill/1.0';
+const DEFAULT_UA = 'dsh-github-search-skill/1.3.0';
 const API_VERSION = '2022-11-28';
+const PER_PAGE_MAX = 100;
 
 // ---------------------------------------------------------------- args
 
@@ -35,6 +36,7 @@ const API_VERSION = '2022-11-28';
 const BOOLEAN_FLAGS = new Set([
   'json', 'help', 'dry-run', 'yes', 'no-wait', 'no-proxy',
   'public', 'private', 'auto-init', 'no-issues', 'wiki', 'archive', 'unarchive',
+  'quality', 'no-quality', 'include-archived', 'no-forks',
 ]);
 
 /** Single-dash aliases. */
@@ -563,6 +565,147 @@ function truncate(s, n) {
   return t.length > n ? `${t.slice(0, n - 1)}…` : t;
 }
 
+// ------------------------------------------------------ search quality
+//
+// GitHub's own ranking (the default "best match") buries live, popular projects
+// under low-signal ones: a broad `repo` query returns archived repositories,
+// projects last pushed years ago, and three-digit-star repos in its top ten —
+// while `sort=stars` answers with a high-star project nobody has touched since
+// 2018. `repo` therefore ranks candidates locally by default:
+//
+//   score = log10(1 + stars)        dominant signal, damped so 100k stars is not
+//                                   100x better than 1k
+//         + 0.8 * exp(-days/365)    recency: full today, ~0.37 at 1y, ~0.13 at 2y
+//         + 0.3 * log10(1 + forks)  adoption beyond stars
+//         - 1.0 archived/disabled
+//         - 0.5 fork
+//
+// Archived and long-stale repositories are dropped outright. Anything explicit
+// wins: `--sort` passes straight through to GitHub and `--no-quality` disables
+// the layer, while every threshold has its own flag.
+
+const DAY_MS = 86400000;
+
+const QUALITY_DEFAULTS = {
+  enabled: true,
+  activeWithinDays: 730,
+  minStars: 0,
+  dropArchived: true,
+  dropForks: false,
+  candidateFactor: 5,
+  candidateFloor: 50,
+};
+
+/** Whole days since an ISO timestamp; Infinity when it is missing/unparseable. */
+function daysSince(iso) {
+  const t = Date.parse(iso || '');
+  return Number.isFinite(t) ? Math.max(0, (Date.now() - t) / DAY_MS) : Infinity;
+}
+
+/** Star-led quality score; activity and forks only ever adjust the ranking. */
+function qualityScore(repo) {
+  const stars = Number(repo.stargazers_count) || 0;
+  const forks = Number(repo.forks_count) || 0;
+  const days = daysSince(repo.pushed_at || repo.updated_at);
+  // ~8-month half-life: a year of silence costs about one order of magnitude of
+  // stars, so a live 40k project outranks a dormant 120k one, while a 100x star
+  // gap still wins at equal freshness.
+  const recency = Number.isFinite(days) ? Math.exp(-days / 240) : 0;
+  let score = Math.log10(1 + stars) + 1.2 * recency + 0.3 * Math.log10(1 + forks);
+  if (repo.archived || repo.disabled) score -= 1;
+  if (repo.fork) score -= 0.5;
+  return score;
+}
+
+/** Non-negative integer flag: 0 is meaningful (it disables that threshold). */
+function intFlag(value, fallback) {
+  if (value === undefined || value === true) return fallback;
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
+}
+
+function qualityOptions(flags, limit) {
+  const forced = flags.quality === true;
+  return {
+    enabled: flags['no-quality'] === true ? false : forced ? true : QUALITY_DEFAULTS.enabled,
+    forced,
+    activeWithinDays: intFlag(flags['active-within'], QUALITY_DEFAULTS.activeWithinDays),
+    minStars: intFlag(flags['min-stars'], QUALITY_DEFAULTS.minStars),
+    dropArchived: flags['include-archived'] === true ? false : QUALITY_DEFAULTS.dropArchived,
+    dropForks: flags['no-forks'] === true ? true : QUALITY_DEFAULTS.dropForks,
+    candidates: Math.min(
+      PER_PAGE_MAX,
+      intFlag(
+        flags.candidates,
+        Math.max(limit * QUALITY_DEFAULTS.candidateFactor, QUALITY_DEFAULTS.candidateFloor),
+      ) || PER_PAGE_MAX,
+    ),
+  };
+}
+
+/** Filter, score and re-rank search hits; `dropped` explains what was removed. */
+function rankQuality(items, opts) {
+  const kept = [];
+  const dropped = { archived: 0, forks: 0, stale: 0, 'low-star': 0 };
+  for (const repo of items || []) {
+    if (opts.dropArchived && (repo.archived || repo.disabled)) {
+      dropped.archived += 1;
+      continue;
+    }
+    if (opts.dropForks && repo.fork) {
+      dropped.forks += 1;
+      continue;
+    }
+    if (opts.minStars && (Number(repo.stargazers_count) || 0) < opts.minStars) {
+      dropped['low-star'] += 1;
+      continue;
+    }
+    const days = daysSince(repo.pushed_at || repo.updated_at);
+    if (opts.activeWithinDays && days > opts.activeWithinDays) {
+      dropped.stale += 1;
+      continue;
+    }
+    kept.push(repo);
+  }
+  kept.sort((a, b) => qualityScore(b) - qualityScore(a));
+  return { items: kept, dropped };
+}
+
+/** "3d ago" / "7mo ago" / "2.4y ago" — coarse on purpose. */
+function ageLabel(days) {
+  if (!Number.isFinite(days)) return 'unknown';
+  if (days < 1) return 'today';
+  if (days < 30) return `${Math.round(days)}d ago`;
+  if (days < 365) return `${Math.round(days / 30)}mo ago`;
+  return `${(days / 365).toFixed(1)}y ago`;
+}
+
+function printReposRanked(data, limit, opts) {
+  const candidates = (data.items || []).length;
+  const { items, dropped } = rankQuality(data.items, opts);
+  const shown = items.slice(0, limit);
+  console.log(
+    `total_count: ${data.total_count}  (ranked ${items.length}/${candidates} by quality, showing ${shown.length})`,
+  );
+  for (const r of shown) {
+    const age = ageLabel(daysSince(r.pushed_at || r.updated_at));
+    console.log(
+      `- ${r.full_name}  ★${r.stargazers_count}  fork=${r.forks_count}  ${r.language || 'n/a'}  pushed ${age}${r.archived ? '  [archived]' : ''}\n    ${truncate(r.description, 140)}\n    ${r.html_url}`,
+    );
+  }
+  const notes = Object.entries(dropped)
+    .filter(([, n]) => n > 0)
+    .map(([kind, n]) => `${n} ${kind}`);
+  if (notes.length) {
+    process.stderr.write(`[quality] dropped ${notes.join(', ')} (of ${candidates} candidates)\n`);
+  }
+  if (!shown.length && candidates) {
+    process.stderr.write(
+      '[quality] every candidate was filtered out — relax with --active-within 0, --include-archived or --min-stars 0\n',
+    );
+  }
+}
+
 function printRepos(data) {
   console.log(`total_count: ${data.total_count}  (showing ${data.items.length})`);
   for (const r of data.items) {
@@ -644,8 +787,6 @@ function printRepoList(items) {
     );
   }
 }
-
-const PER_PAGE_MAX = 100;
 
 // ------------------------------------------------ publish (git + gate)
 
@@ -817,6 +958,17 @@ Search flags:
   --state <s>        issues: open|closed
   --param k=v        extra query parameter for "api" (repeatable)
   --json             print the raw JSON payload
+
+Search quality (repo search — live, popular projects first; ON by default):
+  ranks candidates by log10(stars) + recency + forks, and drops archived and
+  stale repositories before showing --limit of them.
+  --no-quality              use GitHub's own ranking instead
+  --quality                 re-rank even when --sort is given
+  --active-within <days>    drop repositories not pushed in N days (default 730; 0 = keep all)
+  --min-stars <n>           drop repositories below n stars (default 0)
+  --include-archived        keep archived/disabled repositories (dropped by default)
+  --no-forks                also drop forks (kept by default)
+  --candidates <n>          candidates fetched for ranking (default min(100, max(limit*5, 50)))
 
 Repository flags:
   --public | --private      visibility (repo-create defaults to private)
@@ -1095,14 +1247,21 @@ async function main() {
     case 'repo':
     case 'repos': {
       if (!query) throw new Error('repo requires a query');
+      const quality = qualityOptions(flags, limit);
+      // An explicit --sort is a direct instruction, so it goes to GitHub
+      // untouched; --quality overrides that and re-ranks the sorted candidates.
+      const useQuality = quality.enabled && (quality.forced || !flags.sort);
       path = '/search/repositories';
       params = {
         q: query,
-        per_page: limit,
+        per_page: useQuality ? quality.candidates : limit,
         sort: flags.sort || undefined,
         order: flags.order || (flags.sort ? 'desc' : undefined),
       };
-      render = printRepos;
+      render = useQuality ? (data) => printReposRanked(data, limit, quality) : printRepos;
+      if (useQuality && asJson) {
+        process.stderr.write('[quality] --json returns the raw GitHub payload; local ranking is skipped\n');
+      }
       break;
     }
     case 'code': {

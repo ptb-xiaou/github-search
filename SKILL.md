@@ -30,7 +30,7 @@ thin wrapper that forwards to Node.
 | `check` | Validate the token; print login, scopes, rate limits |
 | `config` | Show which credential source is active (token masked) |
 | `limit` | Print every rate-limit bucket |
-| `repo <q>` | Search repositories |
+| `repo <q>` | Search repositories — **quality-ranked by default** (popular + active first) |
 | `code <q>` | Search code — file contents, supports qualifiers |
 | `issues <q>` | Search issues **and** pull requests |
 | `commits <q>` | Search commit messages |
@@ -51,6 +51,26 @@ Repository commands (these write to GitHub — see the rules below):
 Common flags: `--limit <n>` (default 10, max 100), `--sort`, `--order`,
 `--json` (raw payload), `--param k=v`, `--token-file <p>`, `--no-wait`.
 
+Quality flags (**`repo` only**, ranking is on by default):
+
+| Flag | Effect |
+|---|---|
+| `--no-quality` | Use GitHub's own best-match order instead |
+| `--quality` | Re-rank even when `--sort` is given (by default an explicit `--sort` wins) |
+| `--active-within <days>` | Drop repos not pushed in N days (default 730; `0` keeps all) |
+| `--min-stars <n>` | Drop repos below n stars (default 0) |
+| `--include-archived` | Keep archived/disabled repos (dropped by default) |
+| `--no-forks` | Also drop forks (kept by default) |
+| `--candidates <n>` | Candidates fetched for ranking (default `min(100, max(limit*5, 50))`) |
+
+Ranking scores `log10(stars)` + `1.2 × recency` + forks, with an ~8-month recency
+half-life: stars still lead, but a year of silence costs roughly one order of
+magnitude of stars, so a live 40k-star project outranks a dormant 120k-star one.
+It **filters before it sorts** — archived and stale repositories are removed
+first — so `--limit` results are all live projects. The first line reports how
+many candidates survived, and stderr prints what was dropped. `--json` returns
+the untouched payload.
+
 ## Workflow
 
 1. **Run `check` once per session** when anything about credentials or limits is
@@ -66,12 +86,23 @@ Common flags: `--limit <n>` (default 10, max 100), `--sort`, `--order`,
 4. **Read the results, then narrow.** If `total_count` is huge, tighten the
    query instead of raising `--limit`. `--limit` above 100 is not supported by
    GitHub, and a single search cannot page beyond 1000 results.
-5. **Report what came back.** Give the user `owner/repo`, the file path or
+5. **Trust the default ranking when the user wants a good project.** `repo`
+   already removes archived and stale repositories and ranks the rest by
+   popularity × activity, so the first rows are directly usable answers. Use
+   `--sort stars` only when the user asked for that exact ordering, and
+   `--no-quality` only when they want GitHub's own relevance order. If every
+   candidate is filtered out, stderr names the reason — relax with
+   `--active-within 0`, `--include-archived`, or `--min-stars 0` rather than
+   dropping the quality flags and reporting stale results as current.
+6. **Report what came back.** Give the user `owner/repo`, the file path or
    `#number`, and the `html_url`. Never invent a result that the command did not
    return; if the search returns nothing, say so and show the query used.
-6. **Use `--json`** when you need fields the table view omits (topics, license,
+7. **Use `--json`** when you need fields the table view omits (topics, license,
    `pushed_at`, patch URLs) or when you are going to post-process the payload.
-7. **Confirm before any write.** Repository commands change real GitHub state.
+   Note that `--json` returns GitHub's payload untouched, so it skips the local
+   ranking and is not filtered — apply the same guards yourself when you need
+   them.
+8. **Confirm before any write.** Repository commands change real GitHub state.
    Say exactly what will change (visibility, name, deleted repo) and get a yes
    before running them, even when the user's intent seems obvious.
 
