@@ -173,7 +173,8 @@ still answers, and some block both. A locally running proxy fixes both paths:
 
 ```bash
 node scripts/gh-search.mjs check --proxy http://127.0.0.1:7890
-node scripts/gh-search.mjs check --proxy auto      # probe 7890, 7897, 10809, 1080, 8888, 8080
+node scripts/gh-search.mjs check --proxy socks5://127.0.0.1:10808
+node scripts/gh-search.mjs check --proxy auto      # probe 7890, 7897, 10808, 10809, 1080, 8888, 8080
 node scripts/gh-search.mjs publish -m "feat: …"    # gate → commit → push (retries via the proxy)
 ```
 
@@ -188,14 +189,20 @@ Precedence, first match wins:
 | 5 | `$HTTPS_PROXY` / `$ALL_PROXY` |
 
 With no proxy configured, a network-level failure triggers **one** automatic
-retry through the first local port that answers. `publish` applies the same
-fallback to `git push`, so a filtered network does not block publishing.
-`--no-proxy` turns all of it off. Authenticated proxies
-(`http://user:pass@host:port`) send a Basic `Proxy-Authorization` header — put
-those in an environment variable rather than a shell history entry.
+retry through the first local candidate that proves it really is a proxy: every
+port is verified with a real handshake (HTTP `CONNECT` **plus** a TLS
+handshake, or a SOCKS5 `CONNECT`), so an unrelated service that merely listens
+on one of those ports is skipped instead of breaking the retry. Both HTTP and
+SOCKS5 proxies work, and auto-detection records a SOCKS one as `socks5h://` so
+the proxy resolves the hostname. `publish` applies the same fallback to
+`git push`, so a filtered network does not block publishing. `--no-proxy` turns
+all of it off. Authenticated proxies (`http://user:pass@host:port`, or the
+RFC 1929 credentials in `socks5://user:pass@host:port`) are passed to the proxy
+the way its protocol expects — put those in an environment variable rather than
+a shell history entry.
 
-Requests go through an HTTP `CONNECT` tunnel built on `node:net` + `node:tls`,
-so proxying adds no dependency and no TLS downgrade.
+Requests go through an HTTP `CONNECT` or SOCKS5 tunnel built on `node:net` +
+`node:tls`, so proxying adds no dependency and no TLS downgrade.
 
 ## Publishing this skill publicly
 

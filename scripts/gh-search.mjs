@@ -206,8 +206,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // With no proxy configured, a request that fails at the network layer makes the
 // client probe the usual local proxy ports and retry — no flag needed. That
 // fallback is skipped for `--no-proxy` and for an explicit `--proxy <url>`.
-// Requests go through an HTTP CONNECT tunnel implemented with node:net +
-// node:tls, so there is still no dependency to install.
+// Requests go through an HTTP CONNECT or SOCKS5 tunnel implemented with
+// node:net + node:tls, so there is still no dependency to install.
+//
+// Every auto-detected candidate is verified with a real handshake (TLS for an
+// HTTP proxy, a SOCKS5 CONNECT for a SOCKS one). Merely accepting a TCP
+// connection proves nothing: an unrelated service can listen on a proxy port
+// and even answer `CONNECT` with 200 before dropping the stream.
 
 const PROXY_ENV_VARS = [
   'GITHUB_SEARCH_PROXY',
@@ -218,8 +223,10 @@ const PROXY_ENV_VARS = [
   'all_proxy',
 ];
 
-// Clash 7890, Clash Verge 7897, v2rayN 10809, generic 1080/8888/8080.
-const LOCAL_PROXY_PORTS = [7890, 7897, 10809, 1080, 8888, 8080];
+// Clash 7890, Clash Verge 7897, v2rayN SOCKS 10808 / HTTP 10809, generic
+// 1080 / 8888 / 8080. Order matters: the most common defaults come first, and
+// each candidate still has to pass a real handshake before it is used.
+const LOCAL_PROXY_PORTS = [7890, 7897, 10808, 10809, 1080, 8888, 8080];
 
 const PROXY = { disabled: false, explicit: false, url: null, source: null };
 
@@ -281,6 +288,154 @@ function probePort(port, host = '127.0.0.1', timeoutMs = 400) {
   });
 }
 
+function connectSocket(host, port, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect({ host, port });
+    const fail = (err) => {
+      socket.destroy();
+      reject(err);
+    };
+    socket.setTimeout(timeoutMs, () => fail(new Error(`connect to ${host}:${port} timed out`)));
+    socket.once('error', fail);
+    socket.once('connect', () => {
+      socket.setTimeout(0);
+      resolve(socket);
+    });
+  });
+}
+
+/** Read until `isComplete(buf)` holds; null on timeout, EOF or error. */
+function readUntil(socket, timeoutMs, isComplete) {
+  return new Promise((resolve) => {
+    let buf = Buffer.alloc(0);
+    const finish = (value) => {
+      socket.removeListener('data', onData);
+      socket.removeListener('error', onError);
+      socket.removeListener('close', onClose);
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const onData = (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      if (isComplete(buf)) finish(buf);
+    };
+    const onError = () => finish(null);
+    const onClose = () => finish(null);
+    const timer = setTimeout(() => finish(null), timeoutMs);
+    socket.on('data', onData);
+    socket.once('error', onError);
+    socket.once('close', onClose);
+  });
+}
+
+/** TLS handshake over an established tunnel; the caller owns the socket. */
+function tlsHandshake(socket, servername, timeoutMs) {
+  return new Promise((resolve) => {
+    const secure = tls.connect({ socket, servername });
+    const finish = (ok) => {
+      secure.removeAllListeners();
+      resolve(ok);
+    };
+    secure.setTimeout(timeoutMs, () => finish(false));
+    secure.once('secureConnect', () => finish(true));
+    secure.once('error', () => finish(false));
+    secure.once('close', () => finish(false));
+  });
+}
+
+/**
+ * SOCKS5 CONNECT (RFC 1928, with optional RFC 1929 user/pass). The target host
+ * always travels as a domain name, so the proxy resolves it — which also
+ * survives a poisoned local resolver. Resolves the tunnelled socket.
+ */
+function socks5Connect(socket, targetHost, targetPort, timeoutMs, user, pass) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      reject(err);
+    };
+    const sendRequest = () => {
+      const host = Buffer.from(targetHost, 'utf8');
+      const port = Buffer.alloc(2);
+      port.writeUInt16BE(targetPort);
+      socket.write(Buffer.concat([Buffer.from([5, 1, 0, 3, host.length]), host, port]));
+      readUntil(socket, timeoutMs, (b) => b.length >= 4).then((reply) => {
+        if (!reply || reply[0] !== 5) return fail(new Error('malformed SOCKS5 reply'));
+        if (reply[1] !== 0) return fail(new Error(`SOCKS5 CONNECT refused (reply ${reply[1]})`));
+        const atyp = reply[3];
+        if (atyp !== 1 && atyp !== 3 && atyp !== 4) return fail(new Error('malformed SOCKS5 reply address'));
+        const need = atyp === 1 ? 10 : atyp === 4 ? 22 : reply.length >= 5 ? 7 + reply[4] : 0;
+        const consume = (full) => {
+          if (full.length < need) {
+            readUntil(socket, timeoutMs, (b) => b.length >= need).then(consume);
+            return;
+          }
+          const leftover = full.subarray(need);
+          settled = true;
+          socket.setTimeout(0);
+          socket.removeListener('error', fail);
+          if (leftover.length) socket.unshift(leftover);
+          resolve(socket);
+        };
+        consume(reply);
+      });
+    };
+    const sendAuth = () => {
+      const u = Buffer.from(user, 'utf8');
+      const p = Buffer.from(pass || '', 'utf8');
+      socket.write(Buffer.concat([Buffer.from([1, u.length]), u, Buffer.from([p.length]), p]));
+      readUntil(socket, timeoutMs, (b) => b.length >= 2).then((reply) => {
+        if (!reply || reply[1] !== 0) return fail(new Error('SOCKS5 proxy rejected the credentials'));
+        return sendRequest();
+      });
+    };
+    socket.setTimeout(timeoutMs, () => fail(new Error(`SOCKS5 proxy did not answer in ${timeoutMs}ms`)));
+    socket.once('error', fail);
+    readUntil(socket, timeoutMs, (b) => b.length >= 2).then((greeting) => {
+      if (!greeting || greeting[0] !== 5) return fail(new Error('not a SOCKS5 proxy'));
+      if (greeting[1] === 0) return sendRequest();
+      if (greeting[1] === 2) {
+        if (user === undefined) return fail(new Error('SOCKS5 proxy wants credentials; add user:pass to the proxy URL'));
+        return sendAuth();
+      }
+      return fail(new Error(`SOCKS5 proxy wants unsupported auth method ${greeting[1]}`));
+    });
+    socket.write(user === undefined ? Buffer.from([5, 1, 0]) : Buffer.from([5, 2, 0, 2]));
+  });
+}
+
+/**
+ * HTTP CONNECT *and* a TLS handshake. A service that merely answers `CONNECT`
+ * with 200 and then drops the stream must not be mistaken for a proxy.
+ */
+async function probeHttpProxy(port, timeoutMs) {
+  const socket = await connectSocket('127.0.0.1', port, timeoutMs);
+  try {
+    socket.write('CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\n\r\n');
+    const head = await readUntil(socket, timeoutMs, (b) => b.includes('\r\n\r\n'));
+    if (!head || !/^HTTP\/1\.[01] 200\b/.test(head.toString('latin1'))) return false;
+    return await tlsHandshake(socket, 'api.github.com', timeoutMs);
+  } finally {
+    socket.destroy();
+  }
+}
+
+/** SOCKS5 CONNECT to api.github.com:443 — an accepted reply is proof enough. */
+async function probeSocks5Proxy(port, timeoutMs) {
+  const socket = await connectSocket('127.0.0.1', port, timeoutMs);
+  try {
+    await socks5Connect(socket, 'api.github.com', 443, timeoutMs);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    socket.destroy();
+  }
+}
+
 async function detectLocalProxy() {
   if (PROXY.url) return PROXY.url;
   if (!PROXY.detection) {
@@ -288,12 +443,20 @@ async function detectLocalProxy() {
       for (const port of LOCAL_PROXY_PORTS) {
         // sequential on purpose: the first listed port is the most common default
         // eslint-disable-next-line no-await-in-loop
-        if (await probePort(port)) {
+        if (!(await probePort(port))) continue;
+        // SOCKS first: its handshake is cheap and unambiguous, whereas an HTTP
+        // proxy handed a SOCKS greeting simply never answers it.
+        // eslint-disable-next-line no-await-in-loop
+        if (await probeSocks5Proxy(port, 900)) {
+          PROXY.url = `socks5h://127.0.0.1:${port}`;
+        } else {
+          // eslint-disable-next-line no-await-in-loop
+          if (!(await probeHttpProxy(port, 1500))) continue; // listening, but not a proxy
           PROXY.url = `http://127.0.0.1:${port}`;
-          PROXY.source = `auto-detected local proxy on port ${port}`;
-          announceProxy();
-          return PROXY.url;
         }
+        PROXY.source = `auto-detected local proxy on port ${port}`;
+        announceProxy();
+        return PROXY.url;
       }
       return null;
     })().finally(() => {
@@ -312,7 +475,10 @@ function announceProxy() {
 function openTunnel(proxyUrl, targetHost, targetPort, timeoutMs = 15000) {
   const proxy = new URL(proxyUrl);
   const proxyHost = proxy.hostname;
-  const proxyPort = Number(proxy.port || (proxy.protocol === 'https:' ? 443 : 80));
+  const isSocks = /^socks/i.test(proxy.protocol);
+  const proxyPort = Number(proxy.port || (proxy.protocol === 'https:' ? 443 : isSocks ? 1080 : 80));
+  const proxyUser = proxy.username !== '' ? decodeURIComponent(proxy.username) : undefined;
+  const proxyPass = proxy.password !== '' ? decodeURIComponent(proxy.password) : undefined;
   return new Promise((resolveTunnel, reject) => {
     const socket = net.connect({ host: proxyHost, port: proxyPort });
     let settled = false;
@@ -325,6 +491,13 @@ function openTunnel(proxyUrl, targetHost, targetPort, timeoutMs = 15000) {
     socket.setTimeout(timeoutMs, () => fail(new Error(`proxy ${proxyHost}:${proxyPort} did not answer CONNECT in ${timeoutMs}ms`)));
     socket.once('error', fail);
     socket.once('connect', () => {
+      if (isSocks) {
+        socks5Connect(socket, targetHost, targetPort, timeoutMs, proxyUser, proxyPass).then((tunnelled) => {
+          settled = true;
+          resolveTunnel(tunnelled);
+        }, fail);
+        return;
+      }
       const auth =
         proxy.username !== ''
           ? `Proxy-Authorization: Basic ${Buffer.from(
@@ -389,7 +562,7 @@ function parseHttpResponse(buf, url) {
   return { status, headers, body };
 }
 
-/** fetch()-shaped request over an HTTP CONNECT tunnel (no extra packages). */
+/** fetch()-shaped request over an HTTP CONNECT or SOCKS5 tunnel (no extra packages). */
 async function proxyRequest(url, init = {}, proxyUrl) {
   const target = new URL(url);
   const method = init.method || 'GET';
@@ -1000,8 +1173,10 @@ Credential flags:
   --max-wait <sec>   cap on automatic waiting (default 70)
 
 Network flags:
-  --proxy <url>      send requests through an HTTP proxy, e.g. http://127.0.0.1:7890
-  --proxy auto       probe the usual local proxy ports (7890 7897 10809 1080 8888 8080)
+  --proxy <url>      send requests through a proxy, e.g. http://127.0.0.1:7890
+                     or socks5://127.0.0.1:10808 (socks5h keeps DNS at the proxy)
+  --proxy auto       probe the usual local proxy ports and verify each with a
+                     real handshake (7890 7897 10808 10809 1080 8888 8080)
   --no-proxy         never use or auto-detect a proxy
                      (without any proxy flag, a network failure triggers one auto-detect retry)
   Env: $GITHUB_SEARCH_PROXY, $DSH_GITHUB_SEARCH_PROXY, $HTTPS_PROXY, $ALL_PROXY

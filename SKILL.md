@@ -193,26 +193,33 @@ Rules when handling credentials:
 
 On filtered networks `github.com:443` is often reset (so `git push` dies) while
 `api.github.com` still answers, and sometimes both are unreachable. A local
-proxy — Clash/mihomo on 7890, Clash Verge on 7897, v2rayN on 10809, sing-box on
-1080/8080 — fixes both paths:
+proxy — Clash/mihomo on 7890, Clash Verge on 7897, v2rayN on socks 10808 /
+http 10809, sing-box on 1080/8080 — fixes both paths. HTTP and SOCKS5 proxies
+both work:
 
 ```bash
 node scripts/gh-search.mjs check --proxy http://127.0.0.1:7890
+node scripts/gh-search.mjs check --proxy socks5://127.0.0.1:10808
 node scripts/gh-search.mjs check --proxy auto            # probe the usual local ports
 node scripts/gh-search.mjs repo "stars:>5000" --proxy auto
 node scripts/gh-search.mjs publish -m "feat: …"         # push retries through the proxy
 ```
 
 - With **no proxy flag**, a request that fails at the network layer triggers one
-  auto-detect retry through the first local port that answers
-  (`7890`, `7897`, `10809`, `1080`, `8888`, `8080`). `publish` does the same for
+  auto-detect retry through the first local candidate that proves it is a proxy
+  (`7890`, `7897`, `10808`, `10809`, `1080`, `8888`, `8080`). Every candidate is
+  verified with a real handshake — HTTP `CONNECT` plus TLS, or a SOCKS5
+  `CONNECT` — so an unrelated service listening on one of those ports is skipped
+  instead of being used and failing the retry. `publish` does the same for
   `git push`, so a filtered network does not block publishing.
 - `$GITHUB_SEARCH_PROXY`, `$DSH_GITHUB_SEARCH_PROXY`, `$HTTPS_PROXY` and
   `$ALL_PROXY` are honored when no flag is given; the flag always wins.
 - `--no-proxy` disables auto-detection and the fallback entirely.
 - Authenticated proxies work: `--proxy http://user:pass@host:port` sends a Basic
-  `Proxy-Authorization` header. Prefer the environment variable over the flag so
-  the proxy password does not land in shell history.
+  `Proxy-Authorization` header, and `socks5://user:pass@host:port` does the
+  RFC 1929 user/pass handshake. Prefer the environment variable over the flag so
+  the proxy password does not land in shell history. An auto-detected SOCKS
+  proxy is recorded as `socks5h://`, leaving hostname resolution at the proxy.
 - The proxy only carries traffic; credentials are still read from the credential
   file and never written to disk by the client.
 
